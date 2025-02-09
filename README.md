@@ -1,9 +1,20 @@
 # @enemyrr/mcp-mysql-server
 
+[![smithery badge](https://smithery.ai/badge/@enemyrr/mcp-mysql-server)](https://smithery.ai/server/@enemyrr/mcp-mysql-server)
+
 A Model Context Protocol server that provides MySQL database operations. This server enables AI models to interact with MySQL databases through a standardized interface.
 
 ## Installation & Setup for Cursor IDE
 
+### Installing via Smithery
+
+To install MySQL Database Server for Claude Desktop automatically via [Smithery](https://smithery.ai/server/@enemyrr/mcp-mysql-server):
+
+```bash
+npx -y @smithery/cli install @enemyrr/mcp-mysql-server --client claude
+```
+
+### Installing Manually
 1. Clone and build the project:
 ```bash
 git clone https://github.com/enemyrr/mcp-mysql-server.git
