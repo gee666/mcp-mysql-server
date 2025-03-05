@@ -533,12 +533,31 @@ class MySQLServer {
     }
 
     try {
-      const [rows] = await this.connection!.query('DESCRIBE ??', [args.table]);
+      const [rows] = await this.connection!.query(
+        `SELECT 
+          COLUMN_NAME as Field,
+          COLUMN_TYPE as Type,
+          IS_NULLABLE as \`Null\`,
+          COLUMN_KEY as \`Key\`,
+          COLUMN_DEFAULT as \`Default\`,
+          EXTRA as Extra,
+          COLUMN_COMMENT as Comment
+        FROM INFORMATION_SCHEMA.COLUMNS 
+        WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+        ORDER BY ORDINAL_POSITION`,
+        [this.config!.database, args.table]
+      );
+
+      const formattedRows = (rows as any[]).map(row => ({
+        ...row,
+        Null: row.Null === 'YES' ? 'YES' : 'NO'
+      }));
+
       return {
         content: [
           {
             type: 'text',
-            text: JSON.stringify(rows, null, 2),
+            text: JSON.stringify(formattedRows, null, 2),
           },
         ],
       };
