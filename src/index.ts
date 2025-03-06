@@ -119,7 +119,11 @@ class MySQLServer {
 
     if (!this.connection) {
       try {
-        this.connection = await mysql.createConnection(this.config);
+        this.connection = await mysql.createConnection({
+          ...this.config,
+          supportBigNumbers: true,
+          bigNumberStrings: true
+        });
       } catch (error) {
         throw new McpError(
           ErrorCode.InternalError,
