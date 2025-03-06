@@ -1,6 +1,6 @@
 {
   "name": "@enemyrr/mcp-mysql-server",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A Model Context Protocol server for MySQL database operations",
   "type": "module",
   "bin": {

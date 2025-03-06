@@ -15,6 +15,7 @@ import path from 'path';
 // Load environment variables
 config();
 
+// Type definitions
 interface DatabaseConfig {
   host: string;
   user: string;
@@ -22,7 +23,6 @@ interface DatabaseConfig {
   database: string;
 }
 
-// New type definitions
 interface SSLConfig {
   ca?: string;
   cert?: string;
@@ -55,6 +55,27 @@ interface IndexDefinition {
   unique?: boolean;
 }
 
+interface QueryResult {
+  content: Array<{
+    type: 'text';
+    text: string;
+  }>;
+}
+
+interface QueryArgs {
+  sql: string;
+  params?: Array<string | number | boolean | null>;
+}
+
+interface ConnectionArgs {
+  url?: string;
+  workspace?: string;
+  host?: string;
+  user?: string;
+  password?: string;
+  database?: string;
+}
+
 // Type guard for error objects
 function isErrorWithMessage(error: unknown): error is { message: string } {
   return (
@@ -75,8 +96,8 @@ function getErrorMessage(error: unknown): string {
 
 class MySQLServer {
   private server: Server;
-  private connection: mysql.Connection | null = null;
-  private config: DatabaseConfig | null = null;
+  private pool: mysql.Pool | null = null;
+  private config: ConnectionConfig | null = null;
   private currentWorkspace: string | null = null;
 
   constructor() {
@@ -93,20 +114,90 @@ class MySQLServer {
     );
 
     this.setupToolHandlers();
+    this.setupErrorHandlers();
+  }
 
-    // Error handling
+  private setupErrorHandlers() {
     this.server.onerror = (error) => console.error('[MCP Error]', error);
+
     process.on('SIGINT', async () => {
+      await this.cleanup();
+      process.exit(0);
+    });
+
+    process.on('SIGTERM', async () => {
       await this.cleanup();
       process.exit(0);
     });
   }
 
   private async cleanup() {
-    if (this.connection) {
-      await this.connection.end();
+    if (this.pool) {
+      await this.pool.end();
+      this.pool = null;
     }
     await this.server.close();
+  }
+
+  private handleDatabaseError(error: unknown): never {
+    // Handle MySQL-specific errors
+    if (error instanceof Error) {
+      const mysqlError = error as any;
+      const code = mysqlError.code || '';
+      const errno = mysqlError.errno || 0;
+
+      // User input errors (Invalid Request)
+      if (code === 'ER_PARSE_ERROR' || code === 'ER_EMPTY_QUERY') {
+        throw new McpError(ErrorCode.InvalidParams, `Invalid SQL syntax: ${mysqlError.message}`);
+      }
+
+      // Authentication errors (Unauthorized)
+      if (code === 'ER_ACCESS_DENIED_ERROR') {
+        throw new McpError(ErrorCode.InvalidRequest, `Database authentication failed: Invalid credentials`);
+      }
+
+      // Database configuration errors (Internal Error)
+      if (code === 'ER_BAD_DB_ERROR') {
+        throw new McpError(ErrorCode.InternalError, `Database configuration error: Database does not exist`);
+      }
+
+      // Connection errors (Internal Error)
+      if (code === 'ECONNREFUSED' || code === 'ETIMEDOUT' || code === 'ENOTFOUND') {
+        throw new McpError(ErrorCode.InternalError, `Database connection error: ${code}`);
+      }
+
+      // Schema-related errors (Invalid Request)
+      if (code === 'ER_NO_SUCH_TABLE') {
+        throw new McpError(ErrorCode.InvalidParams, `Table does not exist: ${mysqlError.message}`);
+      }
+
+      // Data integrity errors (Invalid Request)
+      if (code === 'ER_DUP_ENTRY') {
+        throw new McpError(ErrorCode.InvalidParams, `Data integrity error: Duplicate entry`);
+      }
+
+      // Log unknown errors for debugging
+      console.error('Unhandled MySQL error:', {
+        code,
+        errno,
+        message: mysqlError.message,
+        stack: mysqlError.stack
+      });
+    }
+
+    // Generic error handling as fallback
+    const message = getErrorMessage(error);
+    throw new McpError(ErrorCode.InternalError, `Unexpected database error: ${message}`);
+  }
+
+  private validateSqlInput(sql: string, allowedTypes: string[]) {
+    const type = sql.trim().split(' ')[0].toUpperCase();
+    if (!allowedTypes.includes(type)) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Invalid SQL type. Allowed: ${allowedTypes.join(', ')}`
+      );
+    }
   }
 
   private async ensureConnection() {
@@ -117,20 +208,140 @@ class MySQLServer {
       );
     }
 
-    if (!this.connection) {
+    if (!this.pool) {
       try {
-        this.connection = await mysql.createConnection({
+        this.pool = mysql.createPool({
           ...this.config,
+          waitForConnections: true,
+          connectionLimit: 10,
+          queueLimit: 0,
+          enableKeepAlive: true,
+          keepAliveInitialDelay: 0,
           supportBigNumbers: true,
           bigNumberStrings: true
         });
+
+        // Test the connection
+        const connection = await this.pool.getConnection();
+        connection.release();
       } catch (error) {
-        throw new McpError(
-          ErrorCode.InternalError,
-          `Failed to connect to database: ${getErrorMessage(error)}`
-        );
+        this.pool = null;
+        this.handleDatabaseError(error);
       }
     }
+
+    if (!this.pool) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        'Failed to establish database connection'
+      );
+    }
+
+    return this.pool;
+  }
+
+  private async executeQuery<T>(sql: string, params: any[] = []): Promise<T> {
+    const pool = await this.ensureConnection();
+    try {
+      const [result] = await pool.query(sql, params);
+      return result as T;
+    } catch (error) {
+      this.handleDatabaseError(error);
+    }
+  }
+
+  private hasDirectConfig(args: ConnectionArgs): boolean {
+    return !!(args.host && args.user && args.password && args.database);
+  }
+
+  private createDirectConfig(args: ConnectionArgs): ConnectionConfig {
+    if (!this.hasDirectConfig(args)) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        'Missing required connection parameters'
+      );
+    }
+
+    return {
+      host: args.host!,
+      user: args.user!,
+      password: args.password!,
+      database: args.database!
+    };
+  }
+
+  private async loadConfig(args: ConnectionArgs): Promise<ConnectionConfig> {
+    if (args.url) return this.parseConnectionUrl(args.url);
+    if (args.workspace) {
+      const config = await this.loadWorkspaceConfig(args.workspace);
+      if (config) return config;
+    }
+    if (this.hasDirectConfig(args)) return this.createDirectConfig(args);
+
+    throw new McpError(
+      ErrorCode.InvalidParams,
+      'No valid configuration provided. Please provide either a URL, workspace path, or connection parameters.'
+    );
+  }
+
+  private async loadWorkspaceConfig(workspace: string): Promise<ConnectionConfig | null> {
+    try {
+      // Try loading .env from the workspace
+      const envPath = path.join(workspace, '.env');
+      const workspaceEnv = require('dotenv').config({ path: envPath });
+
+      if (workspaceEnv.error) {
+        return null;
+      }
+
+      const { DATABASE_URL, DB_HOST, DB_USER, DB_PASSWORD, DB_DATABASE } = workspaceEnv.parsed;
+
+      if (DATABASE_URL) {
+        return this.parseConnectionUrl(DATABASE_URL);
+      }
+
+      if (DB_HOST && DB_USER && DB_PASSWORD && DB_DATABASE) {
+        return {
+          host: DB_HOST,
+          user: DB_USER,
+          password: DB_PASSWORD,
+          database: DB_DATABASE
+        };
+      }
+
+      return null;
+    } catch (error) {
+      console.error('Error loading workspace config:', error);
+      return null;
+    }
+  }
+
+  private parseConnectionUrl(url: string): ConnectionConfig {
+    const parsed = parseUrl(url);
+    if (!parsed.host || !parsed.auth) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        'Invalid connection URL'
+      );
+    }
+
+    const [user, password] = parsed.auth.split(':');
+    const database = parsed.pathname?.slice(1);
+
+    if (!database) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        'Database name must be specified in URL'
+      );
+    }
+
+    return {
+      host: parsed.hostname!,
+      user,
+      password: password || '',
+      database,
+      ssl: parsed.protocol === 'mysqls:' ? { rejectUnauthorized: true } : undefined
+    };
   }
 
   private setupToolHandlers() {
@@ -306,11 +517,11 @@ class MySQLServer {
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       switch (request.params.name) {
         case 'connect_db':
-          return await this.handleConnectDb(request.params.arguments);
+          return await this.handleConnectDb(request.params.arguments as unknown as ConnectionArgs);
         case 'query':
-          return await this.handleQuery(request.params.arguments);
+          return await this.handleQuery(request.params.arguments as unknown as QueryArgs);
         case 'execute':
-          return await this.handleExecute(request.params.arguments);
+          return await this.handleExecute(request.params.arguments as unknown as QueryArgs);
         case 'list_tables':
           return await this.handleListTables();
         case 'describe_table':
@@ -328,74 +539,8 @@ class MySQLServer {
     });
   }
 
-  private async loadWorkspaceConfig(workspace: string): Promise<ConnectionConfig | null> {
-    try {
-      // Try loading .env from the workspace
-      const envPath = path.join(workspace, '.env');
-      const workspaceEnv = require('dotenv').config({ path: envPath });
-
-      if (workspaceEnv.error) {
-        return null;
-      }
-
-      const { DATABASE_URL, DB_HOST, DB_USER, DB_PASSWORD, DB_DATABASE } = workspaceEnv.parsed;
-
-      if (DATABASE_URL) {
-        return this.parseConnectionUrl(DATABASE_URL);
-      }
-
-      if (DB_HOST && DB_USER && DB_PASSWORD && DB_DATABASE) {
-        return {
-          host: DB_HOST,
-          user: DB_USER,
-          password: DB_PASSWORD,
-          database: DB_DATABASE
-        };
-      }
-
-      return null;
-    } catch (error) {
-      console.error('Error loading workspace config:', error);
-      return null;
-    }
-  }
-
-  private async handleConnectDb(args: any) {
-    let config: ConnectionConfig | null = null;
-
-    // Priority 1: Direct URL
-    if (args.url) {
-      config = this.parseConnectionUrl(args.url);
-    }
-    // Priority 2: Workspace config
-    else if (args.workspace) {
-      this.currentWorkspace = args.workspace;
-      config = await this.loadWorkspaceConfig(args.workspace);
-    }
-    // Priority 3: Individual connection params
-    else if (args.host && args.user && args.password && args.database) {
-      config = {
-        host: args.host,
-        user: args.user,
-        password: args.password,
-        database: args.database
-      };
-    }
-
-    if (!config) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        'No valid database configuration provided. Please provide either a URL, workspace path, or connection parameters.'
-      );
-    }
-
-    // Close existing connection if any
-    if (this.connection) {
-      await this.connection.end();
-      this.connection = null;
-    }
-
-    this.config = config;
+  private async handleConnectDb(args: ConnectionArgs) {
+    this.config = await this.loadConfig(args);
 
     try {
       await this.ensureConnection();
@@ -403,7 +548,7 @@ class MySQLServer {
         content: [
           {
             type: 'text',
-            text: `Successfully connected to database ${config.database} at ${config.host}`
+            text: `Successfully connected to database ${this.config.database} at ${this.config.host}`
           }
         ]
       };
@@ -415,167 +560,78 @@ class MySQLServer {
     }
   }
 
-  private parseConnectionUrl(url: string): ConnectionConfig {
-    const parsed = parseUrl(url);
-    if (!parsed.host || !parsed.auth) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        'Invalid connection URL'
-      );
-    }
-
-    const [user, password] = parsed.auth.split(':');
-    const database = parsed.pathname?.slice(1);
-
-    if (!database) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        'Database name must be specified in URL'
-      );
-    }
+  private async handleQuery(args: QueryArgs): Promise<QueryResult> {
+    this.validateSqlInput(args.sql, ['SELECT']);
+    const rows = await this.executeQuery(args.sql, args.params || []);
 
     return {
-      host: parsed.hostname!,
-      user,
-      password: password || '',
-      database,
-      ssl: parsed.protocol === 'mysqls:' ? { rejectUnauthorized: true } : undefined
+      content: [{
+        type: 'text',
+        text: JSON.stringify(rows, null, 2)
+      }]
     };
   }
 
-  private async handleQuery(args: any) {
-    await this.ensureConnection();
+  private async handleExecute(args: QueryArgs): Promise<QueryResult> {
+    this.validateSqlInput(args.sql, ['INSERT', 'UPDATE', 'DELETE']);
+    const result = await this.executeQuery(args.sql, args.params || []);
 
-    if (!args.sql) {
-      throw new McpError(ErrorCode.InvalidParams, 'SQL query is required');
-    }
-
-    if (!args.sql.trim().toUpperCase().startsWith('SELECT')) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        'Only SELECT queries are allowed with query tool'
-      );
-    }
-
-    try {
-      const [rows] = await this.connection!.query(args.sql, args.params || []);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(rows, null, 2),
-          },
-        ],
-      };
-    } catch (error) {
-      throw new McpError(
-        ErrorCode.InternalError,
-        `Query execution failed: ${getErrorMessage(error)}`
-      );
-    }
-  }
-
-  private async handleExecute(args: any) {
-    await this.ensureConnection();
-
-    if (!args.sql) {
-      throw new McpError(ErrorCode.InvalidParams, 'SQL query is required');
-    }
-
-    const sql = args.sql.trim().toUpperCase();
-    if (sql.startsWith('SELECT')) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        'Use query tool for SELECT statements'
-      );
-    }
-
-    try {
-      const [result] = await this.connection!.query(args.sql, args.params || []);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(result, null, 2),
-          },
-        ],
-      };
-    } catch (error) {
-      throw new McpError(
-        ErrorCode.InternalError,
-        `Query execution failed: ${getErrorMessage(error)}`
-      );
-    }
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(result, null, 2)
+      }]
+    };
   }
 
   private async handleListTables() {
-    await this.ensureConnection();
-
-    try {
-      const [rows] = await this.connection!.query('SHOW TABLES');
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(rows, null, 2),
-          },
-        ],
-      };
-    } catch (error) {
-      throw new McpError(
-        ErrorCode.InternalError,
-        `Failed to list tables: ${getErrorMessage(error)}`
-      );
-    }
+    const rows = await this.executeQuery('SHOW TABLES');
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(rows, null, 2),
+        },
+      ],
+    };
   }
 
   private async handleDescribeTable(args: any) {
-    await this.ensureConnection();
-
     if (!args.table) {
       throw new McpError(ErrorCode.InvalidParams, 'Table name is required');
     }
 
-    try {
-      const [rows] = await this.connection!.query(
-        `SELECT 
-          COLUMN_NAME as Field,
-          COLUMN_TYPE as Type,
-          IS_NULLABLE as \`Null\`,
-          COLUMN_KEY as \`Key\`,
-          COLUMN_DEFAULT as \`Default\`,
-          EXTRA as Extra,
-          COLUMN_COMMENT as Comment
-        FROM INFORMATION_SCHEMA.COLUMNS 
-        WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-        ORDER BY ORDINAL_POSITION`,
-        [this.config!.database, args.table]
-      );
+    const rows = await this.executeQuery(
+      `SELECT 
+        COLUMN_NAME as Field,
+        COLUMN_TYPE as Type,
+        IS_NULLABLE as \`Null\`,
+        COLUMN_KEY as \`Key\`,
+        COLUMN_DEFAULT as \`Default\`,
+        EXTRA as Extra,
+        COLUMN_COMMENT as Comment
+      FROM INFORMATION_SCHEMA.COLUMNS 
+      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+      ORDER BY ORDINAL_POSITION`,
+      [this.config!.database, args.table]
+    );
 
-      const formattedRows = (rows as any[]).map(row => ({
-        ...row,
-        Null: row.Null === 'YES' ? 'YES' : 'NO'
-      }));
+    const formattedRows = (rows as any[]).map(row => ({
+      ...row,
+      Null: row.Null === 'YES' ? 'YES' : 'NO'
+    }));
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(formattedRows, null, 2),
-          },
-        ],
-      };
-    } catch (error) {
-      throw new McpError(
-        ErrorCode.InternalError,
-        `Failed to describe table: ${getErrorMessage(error)}`
-      );
-    }
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(formattedRows, null, 2),
+        },
+      ],
+    };
   }
 
   private async handleCreateTable(args: any) {
-    await this.ensureConnection();
-
     const fields = args.fields.map((field: SchemaField) => {
       let def = `\`${field.name}\` ${field.type.toUpperCase()}`;
       if (field.length) def += `(${field.length})`;
@@ -597,27 +653,18 @@ class MySQLServer {
       ${[...fields, ...indexes].join(',\n      ')}
     )`;
 
-    try {
-      await this.connection!.query(sql);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Table ${args.table} created successfully`
-          }
-        ]
-      };
-    } catch (error) {
-      throw new McpError(
-        ErrorCode.InternalError,
-        `Failed to create table: ${getErrorMessage(error)}`
-      );
-    }
+    await this.executeQuery(sql);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Table ${args.table} created successfully`
+        }
+      ]
+    };
   }
 
   private async handleAddColumn(args: any) {
-    await this.ensureConnection();
-
     if (!args.table || !args.field) {
       throw new McpError(ErrorCode.InvalidParams, 'Table name and field are required');
     }
@@ -629,22 +676,15 @@ class MySQLServer {
       sql += ` DEFAULT ${args.field.default === null ? 'NULL' : `'${args.field.default}'`}`;
     }
 
-    try {
-      await this.connection!.query(sql);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Column ${args.field.name} added to table ${args.table}`
-          }
-        ]
-      };
-    } catch (error) {
-      throw new McpError(
-        ErrorCode.InternalError,
-        `Failed to add column: ${getErrorMessage(error)}`
-      );
-    }
+    await this.executeQuery(sql);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Column ${args.field.name} added to table ${args.table}`
+        }
+      ]
+    };
   }
 
   async run() {
@@ -655,4 +695,7 @@ class MySQLServer {
 }
 
 const server = new MySQLServer();
-server.run().catch(console.error);
+server.run().catch((error) => {
+  console.error('Fatal error:', error);
+  process.exit(1);
+});
