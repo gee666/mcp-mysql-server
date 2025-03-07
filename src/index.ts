@@ -6,6 +6,7 @@ import {
   ErrorCode,
   ListToolsRequestSchema,
   McpError,
+  ListResourcesRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import * as mysql from 'mysql2/promise';
 import { config } from 'dotenv';
@@ -109,11 +110,13 @@ class MySQLServer {
       {
         capabilities: {
           tools: {},
+          resources: {}
         },
       }
     );
 
     this.setupToolHandlers();
+    this.setupResourceHandlers();
     this.setupErrorHandlers();
   }
 
@@ -201,49 +204,90 @@ class MySQLServer {
   }
 
   private async ensureConnection() {
-    if (!this.config) {
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        'Database configuration not set. Use connect_db tool first.'
-      );
+    // If we already have a pool, reuse it
+    if (this.pool) {
+      return this.pool;
     }
 
-    if (!this.pool) {
-      try {
-        this.pool = mysql.createPool({
-          ...this.config,
-          waitForConnections: true,
-          connectionLimit: 10,
-          queueLimit: 0,
-          enableKeepAlive: true,
-          keepAliveInitialDelay: 0,
-          supportBigNumbers: true,
-          bigNumberStrings: true
-        });
+    try {
+      // Load config from environment variables
+      let config: ConnectionConfig = {
+        host: process.env.DB_HOST || 'localhost',
+        user: process.env.DB_USER || 'root',
+        password: process.env.DB_PASSWORD || '',
+        database: process.env.DB_DATABASE || '',
+        ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: true } : undefined,
+        connectionTimeout: parseInt(process.env.DB_CONNECTION_TIMEOUT || '10000', 10)
+      };
 
-        // Test the connection
-        const connection = await this.pool.getConnection();
-        connection.release();
-      } catch (error) {
-        this.pool = null;
-        this.handleDatabaseError(error);
+      // Check for DATABASE_URL which takes precedence if available
+      if (process.env.DATABASE_URL) {
+        try {
+          config = this.parseConnectionUrl(process.env.DATABASE_URL);
+        } catch (error) {
+          console.error(`Failed to parse DATABASE_URL: ${getErrorMessage(error)}`);
+          // Continue with other environment variables
+        }
       }
-    }
 
-    if (!this.pool) {
-      throw new McpError(
-        ErrorCode.InternalError,
-        'Failed to establish database connection'
-      );
-    }
+      // Set default connection retry if not specified
+      const connectRetry = {
+        maxAttempts: parseInt(process.env.DB_CONNECT_MAX_ATTEMPTS || '3', 10),
+        delay: parseInt(process.env.DB_CONNECT_RETRY_DELAY || '1000', 10)
+      };
 
-    return this.pool;
+      let lastError = null;
+
+      // Try to connect with retries
+      for (let attempt = 1; attempt <= connectRetry.maxAttempts; attempt++) {
+        try {
+          this.pool = mysql.createPool({
+            ...config,
+            waitForConnections: true,
+            connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT || '10', 10),
+            queueLimit: 0,
+            enableKeepAlive: true,
+            keepAliveInitialDelay: 0,
+            supportBigNumbers: true,
+            bigNumberStrings: true,
+            connectTimeout: config.connectionTimeout || 10000
+          });
+
+          // Test the connection
+          const connection = await this.pool.getConnection();
+          connection.release();
+
+          // Save config for reference
+          this.config = config;
+
+          // Connection successful
+          console.error(`Connected to MySQL server at ${config.host}`);
+          return this.pool;
+        } catch (error) {
+          lastError = error;
+          this.pool = null;
+
+          if (attempt < connectRetry.maxAttempts) {
+            console.error(`Connection attempt ${attempt} failed, retrying in ${connectRetry.delay}ms...`);
+            await new Promise(resolve => setTimeout(resolve, connectRetry.delay));
+          }
+        }
+      }
+
+      // If we get here, all connection attempts failed
+      throw lastError || new Error('Failed to connect to database');
+    } catch (error) {
+      this.pool = null;
+      this.handleDatabaseError(error);
+    }
   }
 
   private async executeQuery<T>(sql: string, params: any[] = []): Promise<T> {
-    const pool = await this.ensureConnection();
+    // Ensure connection is established before executing query
+    await this.ensureConnection();
+
     try {
-      const [result] = await pool.query(sql, params);
+      const [result] = await this.pool!.query(sql, params);
       return result as T;
     } catch (error) {
       this.handleDatabaseError(error);
@@ -294,18 +338,18 @@ class MySQLServer {
         return null;
       }
 
-      const { DATABASE_URL, DB_HOST, DB_USER, DB_PASSWORD, DB_DATABASE } = workspaceEnv.parsed;
+      const { DATABASE_URL, DB_HOST, DB_USER, DB_PASSWORD, DB_NAME } = workspaceEnv.parsed;
 
       if (DATABASE_URL) {
         return this.parseConnectionUrl(DATABASE_URL);
       }
 
-      if (DB_HOST && DB_USER && DB_PASSWORD && DB_DATABASE) {
+      if (DB_HOST && DB_USER && DB_PASSWORD && DB_NAME) {
         return {
           host: DB_HOST,
           user: DB_USER,
           password: DB_PASSWORD,
-          database: DB_DATABASE
+          database: DB_NAME
         };
       }
 
@@ -317,61 +361,70 @@ class MySQLServer {
   }
 
   private parseConnectionUrl(url: string): ConnectionConfig {
-    const parsed = parseUrl(url);
-    if (!parsed.host || !parsed.auth) {
+    try {
+      // Check if URL contains placeholder values
+      if (url.includes('user:pass@host') || url.includes('@host:port/')) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          'The connection URL contains placeholder values. Please provide a valid MySQL connection URL in the format: mysql://username:password@hostname:port/database'
+        );
+      }
+
+      const parsed = parseUrl(url);
+
+      if (!parsed.protocol || (parsed.protocol !== 'mysql:' && parsed.protocol !== 'mysqls:')) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          'Invalid protocol. URL must start with mysql:// or mysqls://'
+        );
+      }
+
+      if (!parsed.hostname) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          'Hostname is required in the connection URL'
+        );
+      }
+
+      // Extract credentials
+      let user = '', password = '';
+      if (parsed.auth) {
+        const authParts = parsed.auth.split(':');
+        user = authParts[0];
+        password = authParts[1] || '';
+      }
+
+      // Extract database name
+      const database = parsed.pathname ? parsed.pathname.replace(/^\//, '') : '';
+
+      if (!database) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          'Database name must be specified in URL'
+        );
+      }
+
+      return {
+        host: parsed.hostname,
+        user,
+        password,
+        database,
+        ssl: parsed.protocol === 'mysqls:' ? { rejectUnauthorized: true } : undefined
+      };
+    } catch (error) {
+      if (error instanceof McpError) {
+        throw error;
+      }
       throw new McpError(
         ErrorCode.InvalidParams,
-        'Invalid connection URL'
+        `Invalid database URL: ${getErrorMessage(error)}`
       );
     }
-
-    const [user, password] = parsed.auth.split(':');
-    const database = parsed.pathname?.slice(1);
-
-    if (!database) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        'Database name must be specified in URL'
-      );
-    }
-
-    return {
-      host: parsed.hostname!,
-      user,
-      password: password || '',
-      database,
-      ssl: parsed.protocol === 'mysqls:' ? { rejectUnauthorized: true } : undefined
-    };
   }
 
   private setupToolHandlers() {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: [
-        {
-          name: 'connect_db',
-          description: 'Connect to MySQL database using URL or config',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              url: {
-                type: 'string',
-                description: 'Database URL (mysql://user:pass@host:port/db)',
-                optional: true
-              },
-              workspace: {
-                type: 'string',
-                description: 'Project workspace path',
-                optional: true
-              },
-              // Keep existing connection params as fallback
-              host: { type: 'string', optional: true },
-              user: { type: 'string', optional: true },
-              password: { type: 'string', optional: true },
-              database: { type: 'string', optional: true }
-            },
-            // No required fields - will try different connection methods
-          },
-        },
         {
           name: 'query',
           description: 'Execute a SELECT query',
@@ -516,8 +569,6 @@ class MySQLServer {
 
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       switch (request.params.name) {
-        case 'connect_db':
-          return await this.handleConnectDb(request.params.arguments as unknown as ConnectionArgs);
         case 'query':
           return await this.handleQuery(request.params.arguments as unknown as QueryArgs);
         case 'execute':
@@ -532,32 +583,20 @@ class MySQLServer {
           return await this.handleAddColumn(request.params.arguments);
         default:
           throw new McpError(
-            ErrorCode.MethodNotFound,
+            ErrorCode.InvalidRequest,
             `Unknown tool: ${request.params.name}`
           );
       }
     });
   }
 
-  private async handleConnectDb(args: ConnectionArgs) {
-    this.config = await this.loadConfig(args);
-
-    try {
-      await this.ensureConnection();
+  private setupResourceHandlers() {
+    // Add handler for resources/list
+    this.server.setRequestHandler(ListResourcesRequestSchema, async () => {
       return {
-        content: [
-          {
-            type: 'text',
-            text: `Successfully connected to database ${this.config.database} at ${this.config.host}`
-          }
-        ]
+        resources: []
       };
-    } catch (error) {
-      throw new McpError(
-        ErrorCode.InternalError,
-        `Failed to connect to database: ${getErrorMessage(error)}`
-      );
-    }
+    });
   }
 
   private async handleQuery(args: QueryArgs): Promise<QueryResult> {
@@ -602,7 +641,7 @@ class MySQLServer {
     }
 
     const rows = await this.executeQuery(
-      `SELECT 
+      `SELECT
         COLUMN_NAME as Field,
         COLUMN_TYPE as Type,
         IS_NULLABLE as \`Null\`,
@@ -610,7 +649,7 @@ class MySQLServer {
         COLUMN_DEFAULT as \`Default\`,
         EXTRA as Extra,
         COLUMN_COMMENT as Comment
-      FROM INFORMATION_SCHEMA.COLUMNS 
+      FROM INFORMATION_SCHEMA.COLUMNS
       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
       ORDER BY ORDINAL_POSITION`,
       [this.config!.database, args.table]
