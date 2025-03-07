@@ -1,20 +1,12 @@
 # @enemyrr/mcp-mysql-server
 
-[![smithery badge](https://smithery.ai/badge/@enemyrr/mcp-mysql-server)](https://smithery.ai/server/@enemyrr/mcp-mysql-server)
 
-A Model Context Protocol server that provides MySQL database operations. This server enables AI models to interact with MySQL databases through a standardized interface.
+A Model Context Protocol server that provides MySQL database operations. This server enables AI models to interact with MySQL databases through a standardized interface, allowing them to run queries, manage schema, and perform various database operations.
 
-<a href="https://glama.ai/mcp/servers/hcqqd3qi8q"><img width="380" height="200" src="https://glama.ai/mcp/servers/hcqqd3qi8q/badge" alt="MCP-MySQL Server MCP server" /></a>
 
 ## Installation & Setup for Cursor IDE
 
-### Installing via Smithery
 
-To install MySQL Database Server for Claude Desktop automatically via [Smithery](https://smithery.ai/server/@enemyrr/mcp-mysql-server):
-
-```bash
-npx -y @smithery/cli install @enemyrr/mcp-mysql-server --client claude
-```
 
 ### Installing Manually
 1. Clone and build the project:
@@ -37,45 +29,21 @@ npm run build
 
 ## Database Configuration
 
-You can configure the database connection in three ways:
 
-1. **Database URL in .env** (Recommended):
-```env
-DATABASE_URL=mysql://user:password@host:3306/database
-```
-
-2. **Individual Parameters in .env**:
 ```env
 DB_HOST=localhost
 DB_USER=your_user
 DB_PASSWORD=your_password
 DB_DATABASE=your_database
+DB_SSL=true  # Optional, enables SSL
+DB_CONNECTION_TIMEOUT=10000  # Optional, defaults to 10000ms
 ```
 
-3. **Direct Connection via Tool**:
-```typescript
-use_mcp_tool({
-  server_name: "mysql",
-  tool_name: "connect_db",
-  arguments: {
-    url: "mysql://user:password@host:3306/database"
-    // OR
-    workspace: "/path/to/your/project" // Will use project's .env
-    // OR
-    host: "localhost",
-    user: "your_user",
-    password: "your_password",
-    database: "your_database"
-  }
-});
-```
+
 
 ## Available Tools
 
-### 1. connect_db
-Connect to MySQL database using URL, workspace path, or direct credentials.
-
-### 2. query
+### 1. query
 Execute SELECT queries with optional prepared statement parameters.
 
 ```typescript
@@ -84,12 +52,12 @@ use_mcp_tool({
   tool_name: "query",
   arguments: {
     sql: "SELECT * FROM users WHERE id = ?",
-    params: [1]
+    params: [1]  // Optional
   }
 });
 ```
 
-### 3. execute
+### 2. execute
 Execute INSERT, UPDATE, or DELETE queries with optional prepared statement parameters.
 
 ```typescript
@@ -98,12 +66,12 @@ use_mcp_tool({
   tool_name: "execute",
   arguments: {
     sql: "INSERT INTO users (name, email) VALUES (?, ?)",
-    params: ["John Doe", "john@example.com"]
+    params: ["John Doe", "john@example.com"]  // Optional
   }
 });
 ```
 
-### 4. list_tables
+### 3. list_tables
 List all tables in the connected database.
 
 ```typescript
@@ -113,7 +81,7 @@ use_mcp_tool({
 });
 ```
 
-### 5. describe_table
+### 4. describe_table
 Get the structure of a specific table.
 
 ```typescript
@@ -126,8 +94,8 @@ use_mcp_tool({
 });
 ```
 
-### 6. create_table
-Create a new table with specified fields and indexes.
+### 5. create_table
+Create a new table with specified fields and optional indexes.
 
 ```typescript
 use_mcp_tool({
@@ -149,7 +117,7 @@ use_mcp_tool({
         nullable: false
       }
     ],
-    indexes: [
+    indexes: [  // Optional
       {
         name: "email_idx",
         columns: ["email"],
@@ -160,7 +128,7 @@ use_mcp_tool({
 });
 ```
 
-### 7. add_column
+### 6. add_column
 Add a new column to an existing table.
 
 ```typescript
@@ -173,7 +141,8 @@ use_mcp_tool({
       name: "phone",
       type: "varchar",
       length: 20,
-      nullable: true
+      nullable: true,
+      default: null  // Optional
     }
   }
 });
@@ -181,28 +150,31 @@ use_mcp_tool({
 
 ## Features
 
-- Multiple connection methods (URL, workspace, direct)
-- Secure connection handling with automatic cleanup
-- Prepared statement support for query parameters
-- Schema management tools
-- Comprehensive error handling and validation
-- TypeScript support
-- Automatic workspace detection
+- **Multiple Connection Methods**: Connect via URL, environment variables, or direct parameters
+- **Connection Pooling**: Efficiently manages database connections
+- **Prepared Statements**: Protection against SQL injection attacks
+- **Comprehensive Schema Tools**: Create tables, add columns, inspect schema
+- **Input Validation**: Validates SQL statements and parameters before execution
+- **SSL Support**: Secure database connections with SSL/TLS
+- **Error Handling**: Detailed error reporting and validation
+- **Automatic Connection Management**: Connections are established on-demand and cleaned up properly
 
 ## Security
 
-- Uses prepared statements to prevent SQL injection
-- Supports secure password handling through environment variables
-- Validates queries before execution
-- Automatically closes connections when done
+- **SQL Injection Protection**: Uses prepared statements for all queries
+- **Secure Password Handling**: Supports environment variables to keep credentials out of code
+- **Input Validation**: Validates query types and parameters
+- **SSL Support**: Secure connections to database servers
+- **Connection Cleanup**: Automatically closes connections to prevent leaks
 
 ## Error Handling
 
 The server provides detailed error messages for:
-- Connection failures
-- Invalid queries or parameters
-- Missing configuration
-- Database errors
+- Connection failures (invalid credentials, unreachable server)
+- Malformed connection strings
+- Invalid queries or query parameters
+- Missing configuration values
+- Database constraint violations
 - Schema validation errors
 
 ## Contributing
