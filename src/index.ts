@@ -427,13 +427,13 @@ class MySQLServer {
       tools: [
         {
           name: 'query',
-          description: 'Execute a SELECT query',
+          description: 'Execute a SELECT or SHOW query',
           inputSchema: {
             type: 'object',
             properties: {
               sql: {
                 type: 'string',
-                description: 'SQL SELECT query',
+                description: 'SQL SELECT or SHOW query',
               },
               params: {
                 type: 'array',
@@ -600,7 +600,7 @@ class MySQLServer {
   }
 
   private async handleQuery(args: QueryArgs): Promise<QueryResult> {
-    this.validateSqlInput(args.sql, ['SELECT']);
+    this.validateSqlInput(args.sql, ['SELECT', 'SHOW']);
     const rows = await this.executeQuery(args.sql, args.params || []);
 
     return {
@@ -624,6 +624,14 @@ class MySQLServer {
   }
 
   private async handleListTables() {
+    // Ensure we have a connection before executing query
+    await this.ensureConnection();
+
+    // Check if config is available and has database property
+    if (!this.config || !this.config.database) {
+      throw new McpError(ErrorCode.InternalError, 'No database connection established');
+    }
+
     const rows = await this.executeQuery('SHOW TABLES');
     return {
       content: [
@@ -640,6 +648,10 @@ class MySQLServer {
       throw new McpError(ErrorCode.InvalidParams, 'Table name is required');
     }
 
+    // Ensure connection is established before accessing this.config
+    await this.ensureConnection();
+
+    // Now we can safely access this.config.database
     const rows = await this.executeQuery(
       `SELECT
         COLUMN_NAME as Field,
