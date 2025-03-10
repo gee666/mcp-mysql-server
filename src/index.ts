@@ -193,16 +193,6 @@ class MySQLServer {
     throw new McpError(ErrorCode.InternalError, `Unexpected database error: ${message}`);
   }
 
-  private validateSqlInput(sql: string, allowedTypes: string[]) {
-    const type = sql.trim().split(' ')[0].toUpperCase();
-    if (!allowedTypes.includes(type)) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        `Invalid SQL type. Allowed: ${allowedTypes.join(', ')}`
-      );
-    }
-  }
-
   private async ensureConnection() {
     // If we already have a pool, reuse it
     if (this.pool) {
@@ -427,40 +417,17 @@ class MySQLServer {
       tools: [
         {
           name: 'query',
-          description: 'Execute a SELECT or SHOW query',
+          description: 'Execute any SQL query (e.g., SELECT, UPDATE, DELETE, SHOW, ALTER TABLE, DROP TABLE, etc.).',
           inputSchema: {
             type: 'object',
             properties: {
               sql: {
                 type: 'string',
-                description: 'SQL SELECT or SHOW query',
+                description: 'SQL query to execute',
               },
               params: {
                 type: 'array',
-                items: {
-                  type: ['string', 'number', 'boolean', 'null'],
-                },
-                description: 'Query parameters (optional)',
-              },
-            },
-            required: ['sql'],
-          },
-        },
-        {
-          name: 'execute',
-          description: 'Execute an INSERT, UPDATE, or DELETE query',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              sql: {
-                type: 'string',
-                description: 'SQL query (INSERT, UPDATE, DELETE)',
-              },
-              params: {
-                type: 'array',
-                items: {
-                  type: ['string', 'number', 'boolean', 'null'],
-                },
+                items: { type: ['string', 'number', 'boolean', 'null'] },
                 description: 'Query parameters (optional)',
               },
             },
@@ -489,80 +456,6 @@ class MySQLServer {
             },
             required: ['table'],
           },
-        },
-        {
-          name: 'create_table',
-          description: 'Create a new table in the database',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              table: {
-                type: 'string',
-                description: 'Table name',
-              },
-              fields: {
-                type: 'array',
-                items: {
-                  type: 'object',
-                  properties: {
-                    name: { type: 'string' },
-                    type: { type: 'string' },
-                    length: { type: 'number', optional: true },
-                    nullable: { type: 'boolean', optional: true },
-                    default: {
-                      type: ['string', 'number', 'null'],
-                      optional: true
-                    },
-                    autoIncrement: { type: 'boolean', optional: true },
-                    primary: { type: 'boolean', optional: true }
-                  },
-                  required: ['name', 'type']
-                }
-              },
-              indexes: {
-                type: 'array',
-                items: {
-                  type: 'object',
-                  properties: {
-                    name: { type: 'string' },
-                    columns: {
-                      type: 'array',
-                      items: { type: 'string' }
-                    },
-                    unique: { type: 'boolean', optional: true }
-                  },
-                  required: ['name', 'columns']
-                },
-                optional: true
-              }
-            },
-            required: ['table', 'fields']
-          }
-        },
-        {
-          name: 'add_column',
-          description: 'Add a new column to existing table',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              table: { type: 'string' },
-              field: {
-                type: 'object',
-                properties: {
-                  name: { type: 'string' },
-                  type: { type: 'string' },
-                  length: { type: 'number', optional: true },
-                  nullable: { type: 'boolean', optional: true },
-                  default: {
-                    type: ['string', 'number', 'null'],
-                    optional: true
-                  }
-                },
-                required: ['name', 'type']
-              }
-            },
-            required: ['table', 'field']
-          }
         }
       ]
     }));
@@ -571,21 +464,12 @@ class MySQLServer {
       switch (request.params.name) {
         case 'query':
           return await this.handleQuery(request.params.arguments as unknown as QueryArgs);
-        case 'execute':
-          return await this.handleExecute(request.params.arguments as unknown as QueryArgs);
         case 'list_tables':
           return await this.handleListTables();
         case 'describe_table':
           return await this.handleDescribeTable(request.params.arguments);
-        case 'create_table':
-          return await this.handleCreateTable(request.params.arguments);
-        case 'add_column':
-          return await this.handleAddColumn(request.params.arguments);
         default:
-          throw new McpError(
-            ErrorCode.InvalidRequest,
-            `Unknown tool: ${request.params.name}`
-          );
+          throw new McpError(ErrorCode.InvalidRequest, `Unknown tool: ${request.params.name}`);
       }
     });
   }
@@ -600,26 +484,15 @@ class MySQLServer {
   }
 
   private async handleQuery(args: QueryArgs): Promise<QueryResult> {
-    this.validateSqlInput(args.sql, ['SELECT', 'SHOW']);
-    const rows = await this.executeQuery(args.sql, args.params || []);
-
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify(rows, null, 2)
-      }]
-    };
-  }
-
-  private async handleExecute(args: QueryArgs): Promise<QueryResult> {
-    this.validateSqlInput(args.sql, ['INSERT', 'UPDATE', 'DELETE']);
+    // Allow any SQL query, so no validation is done here.
     const result = await this.executeQuery(args.sql, args.params || []);
-
     return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify(result, null, 2)
-      }]
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(result, null, 2)
+        }
+      ]
     };
   }
 
@@ -679,62 +552,6 @@ class MySQLServer {
           text: JSON.stringify(formattedRows, null, 2),
         },
       ],
-    };
-  }
-
-  private async handleCreateTable(args: any) {
-    const fields = args.fields.map((field: SchemaField) => {
-      let def = `\`${field.name}\` ${field.type.toUpperCase()}`;
-      if (field.length) def += `(${field.length})`;
-      if (field.nullable === false) def += ' NOT NULL';
-      if (field.default !== undefined) {
-        def += ` DEFAULT ${field.default === null ? 'NULL' : `'${field.default}'`}`;
-      }
-      if (field.autoIncrement) def += ' AUTO_INCREMENT';
-      if (field.primary) def += ' PRIMARY KEY';
-      return def;
-    });
-
-    const indexes = args.indexes?.map((idx: IndexDefinition) => {
-      const type = idx.unique ? 'UNIQUE INDEX' : 'INDEX';
-      return `${type} \`${idx.name}\` (\`${idx.columns.join('`, `')}\`)`;
-    }) || [];
-
-    const sql = `CREATE TABLE \`${args.table}\` (
-      ${[...fields, ...indexes].join(',\n      ')}
-    )`;
-
-    await this.executeQuery(sql);
-    return {
-      content: [
-        {
-          type: 'text',
-          text: `Table ${args.table} created successfully`
-        }
-      ]
-    };
-  }
-
-  private async handleAddColumn(args: any) {
-    if (!args.table || !args.field) {
-      throw new McpError(ErrorCode.InvalidParams, 'Table name and field are required');
-    }
-
-    let sql = `ALTER TABLE \`${args.table}\` ADD COLUMN \`${args.field.name}\` ${args.field.type.toUpperCase()}`;
-    if (args.field.length) sql += `(${args.field.length})`;
-    if (args.field.nullable === false) sql += ' NOT NULL';
-    if (args.field.default !== undefined) {
-      sql += ` DEFAULT ${args.field.default === null ? 'NULL' : `'${args.field.default}'`}`;
-    }
-
-    await this.executeQuery(sql);
-    return {
-      content: [
-        {
-          type: 'text',
-          text: `Column ${args.field.name} added to table ${args.table}`
-        }
-      ]
     };
   }
 
